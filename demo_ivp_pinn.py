@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import math
 
-from pinn_trainer import train_power_series_pinn, solve_ivp, factorial_tensor
+from pinn_trainer import train_power_series_pinn_no_batch, solve_ivp, factorial_tensor
 
 DTYPE = torch.float64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -22,16 +22,17 @@ def train_simple_ivp_pinn():
 
     N = 15
     m = len(c_list) - 1
-    net = train_power_series_pinn(
+    net = train_power_series_pinn_no_batch(
         c_list,
         f_expr,
         None,
         N=N,
         recurrence_weight=75.0,
         bc_weight=100.0,
-        num_batches=3000,
-        batch_size=128,
-        num_collocation=1000,
+        adam_iters=3000,
+        lbfgs_iters=50,
+        num_train_samples=500,
+        num_collocation=200,
         dtype=DTYPE,
         device=DEVICE,
         x_left=-1.0,

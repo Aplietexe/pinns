@@ -426,3 +426,154 @@ def solve_ivp(
     with torch.no_grad():
         a = net(c_bc, freeze_seeds=freeze_seeds, fact=fact)[0]
     return a
+
+
+# -----------------------------------------------------------------------------
+# Alternative: No-batch training with LBFGS
+# -----------------------------------------------------------------------------
+
+
+def train_power_series_pinn_no_batch(
+    c_list: list[sp.Expr],
+    f_expr: sp.Expr,
+    bc_tuples: list[tuple[float, int, float]] | None = None,
+    *,
+    N: int = 10,
+    x_left: float = 0.0,
+    x_right: float = 1.0,
+    num_collocation: int = 1000,
+    bc_weight: float = 100.0,
+    recurrence_weight: float = 1.0,
+    c_range: tuple[float, float] = (-1.0, 1.0),
+    bc_range: tuple[float, float] = (-1.0, 1.0),
+    freeze_seeds: bool = True,
+    adam_iters: int = 5000,
+    lbfgs_iters: int = 100,
+    num_train_samples: int = 1000,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+    seed: int = 1234,
+    progress: bool = True,
+) -> "IVPCoeffNet":
+    """Train IVP-PINN without batching, using all samples at once + LBFGS.
+
+    This approach:
+    1. Pre-generates a fixed set of training ODEs
+    2. Evaluates the loss on ALL ODEs simultaneously (no batching)
+    3. Uses Adam followed by LBFGS fine-tuning
+
+    Warning: Memory intensive for large num_train_samples!
+    """
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(seed)
+
+    # Factorials 0!, …, N!
+    fact = factorial_tensor(N, dtype=dtype, device=device)
+
+    # Collocation grid and inhomogeneous term
+    xs_coll_np = np.linspace(x_left, x_right, num_collocation)
+    xs_collocation = torch.tensor(xs_coll_np, dtype=dtype, device=device)
+
+    x_sym = sp.symbols("x")
+    f_func = sp.lambdify(x_sym, f_expr)
+    f_vals = torch.tensor(f_func(xs_coll_np), dtype=dtype, device=device)
+
+    # Problem order and network
+    m = len(c_list) - 1
+    net = IVPCoeffNet(m, N, dtype=dtype).to(device)
+
+    # Pre-generate all training samples
+    print(f"Generating {num_train_samples} training ODEs...")
+    all_c_bc = sample_batch(
+        num_train_samples, m, c_range, bc_range, dtype=dtype, device=device
+    )
+
+    # ------------------------------------------------------------------
+    def compute_total_loss() -> torch.Tensor:
+        """Compute loss over ALL training samples at once."""
+
+        # Get predictions for all samples
+        a_pred = net(
+            all_c_bc, freeze_seeds=freeze_seeds, fact=fact
+        )  # (num_samples, N+1)
+
+        c = all_c_bc[:, : m + 1]  # (num_samples, m+1)
+        bc = all_c_bc[:, m + 1 :]  # (num_samples, m)
+
+        # PDE residual (evaluated for each sample)
+        u_ks = torch.stack(
+            [_poly_eval(xs_collocation, a_pred, fact, shift=k) for k in range(m + 1)],
+            dim=0,
+        )  # (m+1, num_samples, num_collocation)
+
+        c_reshaped = c.T.unsqueeze(-1)  # (m+1, num_samples, 1)
+        residual = (c_reshaped * u_ks).sum(dim=0) - f_vals.unsqueeze(0)
+        loss_pde = (residual**2).mean()
+
+        # Initial-value mismatch
+        if freeze_seeds:
+            loss_bc = torch.tensor(0.0, device=device)
+        else:
+            seeds_target = bc / fact[:m]
+            loss_bc = ((a_pred[:, :m] - seeds_target) ** 2).mean()
+
+        # Recurrence consistency
+        if recurrence_weight != 0.0:
+            rec_terms = []
+            for ell in range(m, N + 1):
+                n = ell - m
+                ratios = fact[n : n + m] / fact[ell]
+                num = (c[:, :m] * a_pred[:, n : n + m] * ratios).sum(dim=1)
+                a_calc = -num / c[:, m]
+                rec_terms.append((a_pred[:, ell] - a_calc) ** 2)
+            loss_rec = torch.stack(rec_terms).mean()
+        else:
+            loss_rec = torch.tensor(0.0, device=device)
+
+        return loss_pde + bc_weight * loss_bc + recurrence_weight * loss_rec
+
+    # --- Stage 1: Adam ------------------------------------------------------
+    opt = optim.AdamW(net.parameters(), lr=1e-3)
+    if progress:
+        print(f"\nStage 1: Adam optimization (no batching)\n{'-'*40}")
+
+    pbar = trange(adam_iters, desc="Adam", disable=not progress)
+    for _ in pbar:
+        opt.zero_grad(set_to_none=True)
+        loss = compute_total_loss()
+        loss.backward()
+        opt.step()
+        pbar.set_postfix(loss=loss.item())
+
+    # --- Stage 2: LBFGS fine-tuning ----------------------------------------
+    if progress:
+        print(f"\nStage 2: LBFGS fine-tuning\n{'-'*40}")
+
+    opt_lbfgs = optim.LBFGS(
+        net.parameters(),
+        lr=1.0,
+        max_iter=20,
+        tolerance_grad=1e-16,
+        tolerance_change=1e-16,
+        history_size=100,
+        line_search_fn="strong_wolfe",
+    )
+
+    pbar = trange(lbfgs_iters, desc="LBFGS", disable=not progress)
+    for _ in pbar:
+
+        def closure():
+            opt_lbfgs.zero_grad(set_to_none=True)
+            loss_val = compute_total_loss()
+            loss_val.backward()
+            return loss_val
+
+        loss_val = opt_lbfgs.step(closure)
+        pbar.set_postfix(loss=loss_val.item())
+
+    # -----------------------------------------------------------------------
+    net_cpu = net.to("cpu").eval()
+    return net_cpu
