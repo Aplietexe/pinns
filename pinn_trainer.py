@@ -27,6 +27,64 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import trange
 
+# -----------------------------------------------------------------------------
+# New helpers
+# -----------------------------------------------------------------------------
+
+
+def factorial_tensor(
+    n: int, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Return tensor ``[0!, 1!, …, n!]`` on *device* with the requested *dtype*."""
+    return torch.tensor(
+        [math.factorial(i) for i in range(n + 1)], dtype=dtype, device=device
+    )
+
+
+# keep c_m away from zero to avoid division blow-ups in the recurrence term
+
+
+def sample_batch(
+    B: int,
+    m: int,
+    c_range: tuple[float, float],
+    bc_range: tuple[float, float],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    cm_min_abs: float = 0.3,  # minimum |c_m| (last coefficient) allowed
+) -> torch.Tensor:
+    """Sample a batch of constant-coefficient ODEs + initial data.
+
+    The returned tensor has shape ``(B, 2*m + 1)`` and layout
+    ``[c_0 … c_m , y(0), …, y^(m-1)(0)]``.
+    """
+    c = (
+        torch.rand(B, m + 1, dtype=dtype, device=device) * (c_range[1] - c_range[0])
+        + c_range[0]
+    )
+
+    # Enforce |c_m| >= cm_min_abs to keep the recurrence well conditioned
+    # ------------------------------------------------------------------
+    cm = c[:, -1]
+    too_small = cm.abs() < cm_min_abs
+    if too_small.any():
+        n_small = int(too_small.sum().item())
+
+        # Sample new magnitudes in [cm_min_abs, c_range[1]]
+        magnitudes = cm_min_abs + torch.rand(n_small, dtype=dtype, device=device) * (
+            c_range[1] - cm_min_abs
+        )
+        signs = torch.where(torch.rand(n_small, device=device) < 0.5, -1.0, 1.0)
+        cm[too_small] = signs * magnitudes
+        c[:, -1] = cm
+
+    bc = (
+        torch.rand(B, m, dtype=dtype, device=device) * (bc_range[1] - bc_range[0])
+        + bc_range[0]
+    )
+    return torch.cat([c, bc], dim=-1)
+
 
 def make_recurrence(
     c_list: list[sp.Expr],
@@ -159,33 +217,72 @@ def _poly_eval(
         y^{(k)}(x) = Σ_{n=k} s_n · n! / (n-k)! · x^{n-k}
     """
 
-    N = coeffs.shape[0] - 1
+    # Support broadcasting over leading dimensions of ``coeffs``
+    N = coeffs.shape[-1] - 1
     if shift > N:
-        return torch.zeros_like(xs)
+        return torch.zeros(
+            (*coeffs.shape[:-1], xs.shape[0]), dtype=coeffs.dtype, device=coeffs.device
+        )
 
-    a_range = torch.arange(
-        0, N + 1 - shift, device=xs.device, dtype=xs.dtype
-    )  # (0,…,N-shift)
-    powers = xs.unsqueeze(1) ** a_range  # (B, N+1-shift)
+    exp_range = torch.arange(0, N + 1 - shift, device=xs.device, dtype=xs.dtype)
 
-    coeff_slice = coeffs[shift:]  # (N+1-shift,)
+    # x^n  (shape  (P, N+1-shift) ) with P=len(xs)
+    powers = xs.unsqueeze(-1) ** exp_range
+    powers = powers.unsqueeze(0)  # (1, P, N+1-shift)
 
-    # Factorial ratio  n! / (n-k)!  with  n = shift + i  and  i = a_range
+    coeff_slice = coeffs[..., shift:].unsqueeze(-2)  # (..., 1, N+1-shift)
+
     numer = fact[shift:]
     denom = fact[: N + 1 - shift]
-    ratio = numer / denom  # (N+1-shift,)
+    ratio = (numer / denom).unsqueeze(0).unsqueeze(0)  # (1, 1, N+1-shift)
 
-    return (powers * coeff_slice * ratio).sum(dim=1)  # (B,)
+    return (powers * coeff_slice * ratio).sum(dim=-1)
 
 
-class _CoeffNet(nn.Module):
-    def __init__(self, n_coeff: int):
+# -----------------------------------------------------------------------------
+# IVP coefficient predictor
+# -----------------------------------------------------------------------------
+
+
+class IVPCoeffNet(nn.Module):
+    """Predict full (N+1) Maclaurin coefficients from
+    ``[c_0 … c_m , y(0), y'(0)…y^(m-1)(0)]``.
+    """
+
+    def __init__(
+        self, m: int, N: int, hidden: int = 256, dtype: torch.dtype = torch.float32
+    ):
         super().__init__()
-        # self.c = nn.Parameter(1e-2 * torch.randn(n_coeff))
-        self.c = nn.Parameter(torch.zeros(n_coeff))
+        in_dim = 2 * m + 1
+        out_dim = N + 1
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim, dtype=dtype),
+        )
+        self.m = m
 
-    def forward(self) -> torch.Tensor:
-        return self.c
+    def forward(
+        self,
+        c_bc: torch.Tensor,
+        *,
+        freeze_seeds: bool,
+        fact: torch.Tensor,
+    ) -> torch.Tensor:
+        a = self.net(c_bc)
+        if freeze_seeds:
+            bc = c_bc[..., self.m + 1 :]
+            seeds = bc / fact[: self.m]  # a_k = y^(k)(0)/k!
+            a = torch.cat([seeds.detach(), a[..., self.m :]], dim=-1)
+        return a
 
 
 # -----------------------------------------------------------------------------
@@ -196,163 +293,130 @@ class _CoeffNet(nn.Module):
 def train_power_series_pinn(
     c_list: list[sp.Expr],
     f_expr: sp.Expr,
-    bc_tuples: list[tuple[float, int, float]],
+    bc_tuples: list[tuple[float, int, float]] | None = None,
     *,
     N: int = 10,
     x_left: float = 0.0,
     x_right: float = 1.0,
     num_collocation: int = 1000,
     bc_weight: float = 100.0,
-    adam_iters: int = 0,
-    lbfgs_iters: int = 100,
     recurrence_weight: float = 1.0,
+    c_range: tuple[float, float] = (-1.0, 1.0),
+    bc_range: tuple[float, float] = (-1.0, 1.0),
+    freeze_seeds: bool = True,
+    num_batches: int = 10_000,
+    batch_size: int = 128,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
     seed: int = 1234,
     progress: bool = True,
-) -> torch.Tensor:
-    """Train a power-series PINN and return the learned coefficients *a*.
+) -> "IVPCoeffNet":
+    """Train an *IVP-PINN* that maps ODE/BC data to Maclaurin coefficients.
 
-    Parameters
-    ----------
-    c_list, f_expr
-        ODE definition.  The highest derivative order is *m = len(c_list)-1*.
-    bc_tuples
-        Iterable of boundary/initial conditions as *(x0, k, value)*.
-    N
-        Truncation order of the Maclaurin series.
-    x_left, x_right
-        Spatial domain for collocation.
-    num_collocation
-        Number of interior collocation points.
-    bc_weight
-        Relative weight of the BC loss term.
-    adam_iters, lbfgs_iters
-        Optimiser iterations for the two-stage training procedure.
-    recurrence_weight
-        Relative weight of the recurrence consistency loss term.
-    dtype, device, seed
-        Standard PyTorch training knobs.
-    progress
-        If *True*, display progress bars.
-
-    Returns
-    -------
-    torch.Tensor
-        The learned coefficient vector ``a`` of shape *(N+1,)* (on CPU).
+    The network is trained on randomly-sampled **constant-coefficient** IVPs
+    within user-specified ranges.  When *freeze_seeds* is *True*, the first
+    *m* series coefficients are forced to match the supplied initial data and
+    are therefore not updated through back-prop.
     """
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     torch.manual_seed(seed)
 
-    # Pre-compute factorials 0!, …, N!
-    fact = torch.tensor(
-        [math.factorial(i) for i in range(N + 1)], dtype=dtype, device=device
-    )
+    # Factorials 0!, …, N!
+    fact = factorial_tensor(N, dtype=dtype, device=device)
 
-    # Collocation points (uniform grid)
+    # Collocation grid and inhomogeneous term
     xs_coll_np = np.linspace(x_left, x_right, num_collocation)
     xs_collocation = torch.tensor(xs_coll_np, dtype=dtype, device=device)
 
-    # Lambdify coefficient functions & RHS on numpy, then convert once to torch
     x_sym = sp.symbols("x")
-    c_funcs = [sp.lambdify(x_sym, c) for c in c_list]
     f_func = sp.lambdify(x_sym, f_expr)
-
-    c_vals = [
-        torch.tensor(cf(xs_coll_np), dtype=dtype, device=device) for cf in c_funcs
-    ]
     f_vals = torch.tensor(f_func(xs_coll_np), dtype=dtype, device=device)
 
-    m = len(c_list) - 1  # highest derivative order
+    # Problem order and network
+    m = len(c_list) - 1
+    net = IVPCoeffNet(m, N, dtype=dtype).to(device)
 
-    # Neural network that outputs (N+1) coefficients
-    net = _CoeffNet(N + 1).to(device)
+    # ------------------------------------------------------------------
+    def compute_loss(c_bc: torch.Tensor) -> torch.Tensor:
+        """Compute composite loss for a batch of IVPs."""
 
-    # Build recurrence for additional loss term
-    rec_next_coef = make_recurrence(
-        c_list,
-        f_expr,
-        dtype=dtype,
-        device=device,
-        max_n=N - m,
-    )
+        a_pred = net(c_bc, freeze_seeds=freeze_seeds, fact=fact)  # (B, N+1)
 
-    def loss_fn() -> torch.Tensor:
-        coeffs = net()  # (N+1,)
+        c = c_bc[:, : m + 1]  # (B, m+1)
+        bc = c_bc[:, m + 1 :]  # (B, m)
 
-        # ODE residual
-        u_ks = [_poly_eval(xs_collocation, coeffs, fact, shift=k) for k in range(m + 1)]
-        residual = sum(c_vals[k] * u_ks[k] for k in range(m + 1)) - f_vals
+        # PDE residual --------------------------------------------------
+        u_ks = torch.stack(
+            [_poly_eval(xs_collocation, a_pred, fact, shift=k) for k in range(m + 1)],
+            dim=0,
+        )  # (m+1, B, P)
+
+        # c shape: (B, m+1), need to reshape to (m+1, B, 1) for broadcasting
+        c_reshaped = c.T.unsqueeze(-1)  # (m+1, B, 1)
+        residual = (c_reshaped * u_ks).sum(dim=0) - f_vals.unsqueeze(0)  # (B, P)
         loss_pde = (residual**2).mean()
 
-        # Boundary / initial conditions
-        bc_terms: list[torch.Tensor] = []
-        for x0, k, val in bc_tuples:
-            x_t = torch.tensor([x0], dtype=dtype, device=device)
-            u_val = _poly_eval(x_t, coeffs, fact, shift=k)
-            bc_terms.append((u_val - val) ** 2)
-        loss_bc = (
-            torch.sum(torch.stack(bc_terms))
-            if bc_terms
-            else torch.tensor(0.0, device=device)
-        )
+        # Initial-value mismatch --------------------------------------
+        if freeze_seeds:
+            loss_bc = torch.tensor(0.0, device=device)
+        else:
+            seeds_target = bc / fact[:m]
+            loss_bc = ((a_pred[:, :m] - seeds_target) ** 2).mean()
 
-        # Recurrence consistency loss
-        rec_terms: list[torch.Tensor] = []
+        # Recurrence consistency --------------------------------------
         if recurrence_weight != 0.0:
+            rec_terms = []
             for ell in range(m, N + 1):
-                a_prev = coeffs[:ell]
-                a_pred = rec_next_coef(a_prev)
-                rec_terms.append((coeffs[ell] - a_pred) ** 2)
-        loss_rec = (
-            torch.stack(rec_terms).mean()
-            if rec_terms
-            else torch.tensor(0.0, device=device)
-        )
-        # print(loss_pde, loss_bc, loss_rec)
+                n = ell - m
+                ratios = fact[n : n + m] / fact[ell]  # (m,)
+                num = (c[:, :m] * a_pred[:, n : n + m] * ratios).sum(dim=1)
+                a_calc = -num / c[:, m]
+                rec_terms.append((a_pred[:, ell] - a_calc) ** 2)
+            loss_rec = torch.stack(rec_terms).mean()
+        else:
+            loss_rec = torch.tensor(0.0, device=device)
 
         return loss_pde + bc_weight * loss_bc + recurrence_weight * loss_rec
 
-    # --- stage 1: Adam ------------------------------------------------------
-    opt = optim.AdamW(net.parameters(), lr=1e-3)
+    # ------------------------------------------------------------------
+    opt = optim.AdamW(net.parameters(), lr=1e-5)
     if progress:
-        print("\nStage 1: Adam optimisation\n--------------------------")
-    pbar = trange(adam_iters, desc="Adam", disable=not progress)
+        print("\nTraining IVP-PINN (Adam)\n-------------------------")
+
+    pbar = trange(num_batches, desc="Adam", disable=not progress)
     for _ in pbar:
+        c_bc = sample_batch(
+            batch_size, m, c_range, bc_range, dtype=dtype, device=device
+        )
         opt.zero_grad(set_to_none=True)
-        l = loss_fn()
-        l.backward()
+        loss_val = compute_loss(c_bc)
+        loss_val.backward()
         opt.step()
-        pbar.set_postfix(loss=l.item())
-
-    # --- stage 2: LBFGS fine-tuning ----------------------------------------
-    if progress:
-        print("\nStage 2: LBFGS fine-tuning\n--------------------------")
-
-    opt_lbfgs = optim.LBFGS(
-        net.parameters(),
-        lr=1.0,
-        max_iter=200,
-        tolerance_grad=1e-16,
-        tolerance_change=1e-16,
-        history_size=1000,
-        line_search_fn="strong_wolfe",
-    )
-
-    pbar = trange(lbfgs_iters, desc="LBFGS", disable=not progress)
-    for _ in pbar:
-
-        def closure():
-            opt_lbfgs.zero_grad(set_to_none=True)
-            loss_val = loss_fn()
-            loss_val.backward()
-            return loss_val
-
-        loss_val = opt_lbfgs.step(closure)
         pbar.set_postfix(loss=loss_val.item())
 
-    # -----------------------------------------------------------------------
-    coeff_learned = net().detach().cpu()
-    return coeff_learned
+    net_cpu = net.to("cpu").eval()
+    return net_cpu
+
+
+# -----------------------------------------------------------------------------
+# Inference helper
+# -----------------------------------------------------------------------------
+
+
+def solve_ivp(
+    c: torch.Tensor,
+    bc: torch.Tensor,
+    net: IVPCoeffNet,
+    fact: torch.Tensor,
+    *,
+    freeze_seeds: bool = True,
+) -> torch.Tensor:
+    """Predict Maclaurin coefficients for a single IVP using *net*."""
+
+    c_bc = torch.cat([c, bc]).unsqueeze(0)  # (1, 2m+1)
+    with torch.no_grad():
+        a = net(c_bc, freeze_seeds=freeze_seeds, fact=fact)[0]
+    return a

@@ -3,6 +3,7 @@
         "coeff",
         "coeffs",
         "funcs",
+        "GELU",
         "idxs",
         "isscalar",
         "lambdified",
