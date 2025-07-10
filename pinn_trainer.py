@@ -266,6 +266,12 @@ class IVPCoeffNet(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, hidden, dtype=dtype),
             nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.GELU(),
             nn.Linear(hidden, out_dim, dtype=dtype),
         )
         self.m = m
