@@ -1,7 +1,6 @@
 import sympy as sp
 import torch
-from direct_solver import solve_power_series
-from pinn_trainer import train_power_series_pinn
+from single_ode import train_power_series_pinn
 from pinn_evaluate import solve_and_plot
 
 DTYPE = torch.float64
