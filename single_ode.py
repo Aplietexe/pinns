@@ -178,21 +178,6 @@ def _poly_eval(
     return (powers * coeff_slice * ratio).sum(dim=1)  # (B,)
 
 
-class _CoeffNet(nn.Module):
-    def __init__(self, n_coeff: int):
-        super().__init__()
-        # self.c = nn.Parameter(1e-2 * torch.randn(n_coeff))
-        self.c = nn.Parameter(torch.zeros(n_coeff))
-
-    def forward(self) -> torch.Tensor:
-        return self.c
-
-
-# -----------------------------------------------------------------------------
-# New: autoregressive coefficient generator
-# -----------------------------------------------------------------------------
-
-
 class _SinusoidalPositionalEncoding(nn.Module):
     """Standard sinusoidal positional encoding (à la Vaswani et al.)."""
 
@@ -315,7 +300,6 @@ def train_power_series_pinn(
     seed: int = 1234,
     progress: bool = True,
     # Network configuration -------------------------------------------------
-    autoregressive: bool = True,
     d_model: int = 128,
     n_layers: int = 2,
     nhead: int = 8,
@@ -382,19 +366,15 @@ def train_power_series_pinn(
     # Neural network that *generates* the coefficients
     # ------------------------------------------------------------------
 
-    if autoregressive:
-        net = _ARTransformerCoeffNet(
-            d_model=d_model,
-            n_layers=n_layers,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            max_len=N + 2,
-            dtype=dtype,
-        ).to(device=device, dtype=dtype)
-    else:
-        # Legacy: directly optimise all coefficients at once
-        net = _CoeffNet(N + 1).to(device=device, dtype=dtype)
+    net = _ARTransformerCoeffNet(
+        d_model=d_model,
+        n_layers=n_layers,
+        nhead=nhead,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        max_len=N + 2,
+        dtype=dtype,
+    ).to(device=device, dtype=dtype)
 
     # Build recurrence for additional loss term
     rec_next_coef = make_recurrence(
