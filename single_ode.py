@@ -307,8 +307,8 @@ def train_power_series_pinn(
     x_right: float = 1.0,
     num_collocation: int = 1000,
     bc_weight: float = 100.0,
-    adam_iters: int = 5000,
-    lbfgs_iters: int = 0,
+    adam_iters: int = 1000,
+    lbfgs_iters: int = 15,
     recurrence_weight: float = 1.0,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
@@ -316,10 +316,10 @@ def train_power_series_pinn(
     progress: bool = True,
     # Network configuration -------------------------------------------------
     autoregressive: bool = True,
-    d_model: int = 256,
-    n_layers: int = 5,
-    nhead: int = 16,
-    dim_feedforward: int = 1024,
+    d_model: int = 128,
+    n_layers: int = 2,
+    nhead: int = 8,
+    dim_feedforward: int = 512,
     dropout: float = 0.0,
 ) -> torch.Tensor:
     """Train a power-series PINN and return the learned coefficients *a*.
@@ -472,7 +472,7 @@ def train_power_series_pinn(
         max_iter=40,
         tolerance_grad=1e-16,
         tolerance_change=1e-16,
-        history_size=200,
+        history_size=30,
         line_search_fn="strong_wolfe",
     )
 
