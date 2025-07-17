@@ -142,7 +142,9 @@ class ComprehensiveTrainingLogger:
 
         return stats
 
-    def log_training_step(self, epoch, train_loss, val_loss, optimizer, training_time):
+    def log_training_step(
+        self, epoch, train_loss, val_loss, optimizer, training_time, phase="AdamW"
+    ):
         """Log comprehensive training dynamics"""
 
         # Core training metrics
@@ -153,6 +155,7 @@ class ComprehensiveTrainingLogger:
             "val_loss": val_loss if val_loss is not None else np.nan,
             "learning_rate": lr,
             "training_time": training_time,
+            "phase": phase,
         }
         self.data["training_log"].append(training_data)
 
@@ -172,7 +175,7 @@ class ComprehensiveTrainingLogger:
         # Parameter statistics
         param_stats = self.calculate_layer_stats(param_tensors)
         for layer_name, stats in param_stats.items():
-            param_data = {"epoch": epoch, "layer": layer_name}
+            param_data = {"epoch": epoch, "layer": layer_name, "phase": phase}
             param_data.update(stats)
             self.data["parameter_dynamics"].append(param_data)
 
@@ -184,7 +187,7 @@ class ComprehensiveTrainingLogger:
 
         grad_stats = self.calculate_layer_stats(grad_tensors)
         for layer_name, stats in grad_stats.items():
-            grad_data = {"epoch": epoch, "layer": layer_name}
+            grad_data = {"epoch": epoch, "layer": layer_name, "phase": phase}
             grad_data.update(stats)
             self.data["gradient_dynamics"].append(grad_data)
 
@@ -227,6 +230,7 @@ class ComprehensiveTrainingLogger:
                 "epoch": epoch,
                 "layer": layer_name,
                 "update_to_weight_ratio": ratio,
+                "phase": phase,
             }
             self.data["update_ratios"].append(ratio_data)
 
@@ -464,12 +468,32 @@ def create_training_dataset(recurrence_fn, num_samples=200):
     return dataset
 
 
-def train_with_comprehensive_logging(
-    model, train_dataset, val_dataset=None, max_epochs=4000, time_limit=3600
-):  # 1 hour limit
-    """Train model with comprehensive per-layer logging"""
+def create_deterministic_closure(model, train_dataset, criterion):
+    """Create deterministic closure for L-BFGS optimizer"""
+
+    def closure():
+        model.train()
+        total_loss = 0.0
+
+        # Fixed order iteration (deterministic)
+        for prefix, target in train_dataset:
+            pred = model(prefix)
+            loss = criterion(pred, target)
+            total_loss += loss.item()
+
+        # Compute average loss for backward pass
+        avg_loss = total_loss / len(train_dataset)
+        return avg_loss
+
+    return closure
+
+
+def train_adamw_phase(
+    model, train_dataset, val_dataset, logger, max_epochs=3000, time_limit=3600
+):
+    """Train model with AdamW optimizer"""
     if not train_dataset:
-        return float("inf"), 0, None
+        return float("inf"), 0, {}
 
     # Use AdamW optimizer with 3x lower learning rate
     optimizer = optim.AdamW(model.parameters(), lr=1e-3 / 3, weight_decay=0.01)
@@ -480,22 +504,13 @@ def train_with_comprehensive_logging(
         optimizer, mode="min", factor=0.5, patience=200
     )
 
-    # Initialize comprehensive logger
-    logger = ComprehensiveTrainingLogger(model)
-
     start_time = time.time()
     model.train()
 
     best_loss = float("inf")
     convergence_milestones = {}
 
-    print(f"Starting FP64 GPU training with comprehensive logging:")
-    print(
-        f"  Dataset: {len(train_dataset)} training, {len(val_dataset) if val_dataset else 0} validation"
-    )
-    print(f"  Max epochs: {max_epochs}, Time limit: {time_limit/60:.1f} minutes")
-    print(f"  Precision: {DTYPE}")
-    print(f"  Device: {DEVICE}")
+    print(f"STAGE 1: AdamW Training ({max_epochs} epochs)")
     print(f"  Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
 
     for epoch in range(max_epochs):
@@ -531,7 +546,9 @@ def train_with_comprehensive_logging(
 
         # Log comprehensive training dynamics
         epoch_time = time.time() - epoch_start
-        logger.log_training_step(epoch, avg_loss, val_loss, optimizer, epoch_time)
+        logger.log_training_step(
+            epoch, avg_loss, val_loss, optimizer, epoch_time, phase="AdamW"
+        )
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -544,30 +561,225 @@ def train_with_comprehensive_logging(
         for milestone in milestones:
             if avg_loss < milestone and milestone not in convergence_milestones:
                 convergence_milestones[milestone] = epoch
-                print(f"    *** MILESTONE: {milestone:.0e} at epoch {epoch} ***")
+                print(f"    *** AdamW MILESTONE: {milestone:.0e} at epoch {epoch} ***")
 
         # Progress reporting
-        if epoch % 5 == 0:
+        if epoch % 100 == 0:
             lr = optimizer.param_groups[0]["lr"]
             val_str = f", val: {val_loss:.2e}" if val_loss else ""
-            print(f"    Epoch {epoch}: {avg_loss:.2e} (lr: {lr:.2e}{val_str})")
+            print(f"    AdamW Epoch {epoch}: {avg_loss:.2e} (lr: {lr:.2e}{val_str})")
 
-        # Early stopping
-        if avg_loss < 1e-12:
-            print(f"    Early stopping at epoch {epoch}: {avg_loss:.2e}")
+        # Time limit
+        if time.time() - start_time > time_limit:
+            print(f"    AdamW time limit reached at epoch {epoch}")
+            break
+
+    total_time = time.time() - start_time
+    print(f"AdamW training completed: {total_time:.1f}s, {epoch+1} epochs")
+    print(f"AdamW best loss: {best_loss:.2e}")
+
+    return best_loss, epoch + 1, convergence_milestones, total_time
+
+
+def train_lbfgs_phase(
+    model, train_dataset, val_dataset, logger, max_steps=100, time_limit=3600
+):
+    """Train model with L-BFGS optimizer"""
+    if not train_dataset:
+        return float("inf"), 0, {}
+
+    # Set random seed for deterministic behavior
+    torch.manual_seed(42)
+
+    # Use L-BFGS optimizer
+    optimizer = optim.LBFGS(
+        model.parameters(),
+        lr=1.0,
+        max_iter=1,  # One closure call per step
+        tolerance_grad=1e-12,
+        tolerance_change=1e-15,
+        history_size=10,
+        line_search_fn="strong_wolfe",
+    )
+
+    criterion = nn.MSELoss()
+
+    # Create deterministic closure
+    closure = create_deterministic_closure(model, train_dataset, criterion)
+
+    start_time = time.time()
+    model.train()
+
+    best_loss = float("inf")
+    convergence_milestones = {}
+
+    print(f"STAGE 2: L-BFGS Fine-tuning ({max_steps} steps)")
+    print(f"  L-BFGS configured for ultra-precise convergence")
+
+    # Get initial loss for milestone tracking
+    initial_loss = closure()
+    epoch_offset = 3000  # Continue epoch numbering from AdamW phase
+
+    for step in range(max_steps):
+        step_start = time.time()
+
+        def closure_with_backward():
+            optimizer.zero_grad()
+            total_loss = 0.0
+
+            # Fixed order iteration (deterministic)
+            for prefix, target in train_dataset:
+                pred = model(prefix)
+                loss = criterion(pred, target)
+                total_loss += loss.item()
+
+            # Compute average loss for backward pass
+            avg_loss = total_loss / len(train_dataset)
+            avg_loss_tensor = torch.tensor(
+                avg_loss, dtype=DTYPE, device=DEVICE, requires_grad=True
+            )
+
+            # Compute gradients
+            model.zero_grad()
+            total_loss_tensor = torch.tensor(
+                0.0, dtype=DTYPE, device=DEVICE, requires_grad=True
+            )
+            for prefix, target in train_dataset:
+                pred = model(prefix)
+                loss = criterion(pred, target)
+                total_loss_tensor = total_loss_tensor + loss
+
+            avg_loss_tensor = total_loss_tensor / len(train_dataset)
+            avg_loss_tensor.backward()
+
+            return avg_loss_tensor
+
+        # Perform L-BFGS step
+        loss = optimizer.step(closure_with_backward)
+        avg_loss = loss.item()
+
+        # Validation step
+        val_loss = None
+        if val_dataset:
+            model.eval()
+            with torch.no_grad():
+                val_total = 0.0
+                for prefix, target in val_dataset:
+                    pred = model(prefix)
+                    val_total += criterion(pred, target).item()
+                val_loss = val_total / len(val_dataset)
+            model.train()
+
+        # Log comprehensive training dynamics
+        step_time = time.time() - step_start
+        current_epoch = epoch_offset + step
+        logger.log_training_step(
+            current_epoch, avg_loss, val_loss, optimizer, step_time, phase="L-BFGS"
+        )
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+
+        # Track convergence milestones
+        milestones = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12]
+        for milestone in milestones:
+            if avg_loss < milestone and milestone not in convergence_milestones:
+                convergence_milestones[milestone] = current_epoch
+                print(f"    *** L-BFGS MILESTONE: {milestone:.0e} at step {step} ***")
+
+        # Progress reporting
+        if step % 10 == 0:
+            val_str = f", val: {val_loss:.2e}" if val_loss else ""
+            print(f"    L-BFGS Step {step}: {avg_loss:.2e}{val_str}")
+
+        # Early stopping for ultra-precise convergence
+        if avg_loss < 1e-14:
+            print(f"    L-BFGS early stopping at step {step}: {avg_loss:.2e}")
             break
 
         # Time limit
         if time.time() - start_time > time_limit:
-            print(f"    Time limit reached at epoch {epoch}")
+            print(f"    L-BFGS time limit reached at step {step}")
             break
 
     total_time = time.time() - start_time
-    print(f"Training completed: {total_time:.1f}s, {epoch+1} epochs")
-    print(f"Best loss: {best_loss:.2e}")
-    print(f"Convergence milestones: {convergence_milestones}")
+    print(f"L-BFGS training completed: {total_time:.1f}s, {step+1} steps")
+    print(f"L-BFGS best loss: {best_loss:.2e}")
 
-    return best_loss, epoch + 1, logger, convergence_milestones, total_time
+    return best_loss, step + 1, convergence_milestones, total_time
+
+
+def train_with_comprehensive_logging(
+    model,
+    train_dataset,
+    val_dataset=None,
+    adamw_epochs=3000,
+    lbfgs_steps=100,
+    time_limit=3600,
+):  # 1 hour limit
+    """Train model with two-stage approach: AdamW + L-BFGS"""
+    if not train_dataset:
+        return float("inf"), 0, None
+
+    print(
+        f"TWO-STAGE TRAINING: AdamW ({adamw_epochs} epochs) + L-BFGS ({lbfgs_steps} steps)"
+    )
+    print(
+        f"  Dataset: {len(train_dataset)} training, {len(val_dataset) if val_dataset else 0} validation"
+    )
+    print(f"  Precision: {DTYPE}")
+    print(f"  Device: {DEVICE}")
+    print(f"  Total time limit: {time_limit/60:.1f} minutes")
+    print()
+
+    # Initialize comprehensive logger
+    logger = ComprehensiveTrainingLogger(model)
+
+    start_time = time.time()
+
+    # Stage 1: AdamW training
+    adamw_time_limit = time_limit * 0.7  # 70% of time for AdamW
+    adamw_best_loss, adamw_epochs_completed, adamw_milestones, adamw_time = (
+        train_adamw_phase(
+            model, train_dataset, val_dataset, logger, adamw_epochs, adamw_time_limit
+        )
+    )
+
+    # Stage 2: L-BFGS fine-tuning
+    remaining_time = time_limit - adamw_time
+    lbfgs_best_loss, lbfgs_steps_completed, lbfgs_milestones, lbfgs_time = (
+        train_lbfgs_phase(
+            model, train_dataset, val_dataset, logger, lbfgs_steps, remaining_time
+        )
+    )
+
+    # Combined results
+    total_time = time.time() - start_time
+    best_loss = min(adamw_best_loss, lbfgs_best_loss)
+
+    # Combine milestones
+    combined_milestones = {}
+    combined_milestones.update(adamw_milestones)
+    combined_milestones.update(lbfgs_milestones)
+
+    print(f"\nTWO-STAGE TRAINING COMPLETED:")
+    print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+    print(f"  AdamW time: {adamw_time:.1f}s, L-BFGS time: {lbfgs_time:.1f}s")
+    print(
+        f"  AdamW epochs: {adamw_epochs_completed}, L-BFGS steps: {lbfgs_steps_completed}"
+    )
+    print(f"  AdamW best loss: {adamw_best_loss:.2e}")
+    print(f"  L-BFGS best loss: {lbfgs_best_loss:.2e}")
+    print(f"  Overall best loss: {best_loss:.2e}")
+    print(f"  Combined milestones: {combined_milestones}")
+
+    return (
+        best_loss,
+        adamw_epochs_completed + lbfgs_steps_completed,
+        logger,
+        combined_milestones,
+        total_time,
+    )
 
 
 def main():
@@ -599,7 +811,7 @@ def main():
         return
 
     # Create datasets
-    train_dataset = create_training_dataset(recurrence_fn, num_samples=200)
+    train_dataset = create_training_dataset(recurrence_fn, num_samples=5)
     val_dataset = create_training_dataset(recurrence_fn, num_samples=30)
 
     if not train_dataset:
@@ -618,10 +830,15 @@ def main():
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
-    # Train with comprehensive logging (1 hour limit, 10k max epochs)
+    # Train with comprehensive logging (1 hour limit, 3k AdamW + 100 L-BFGS)
     best_loss, epochs, logger, milestones, total_time = (
         train_with_comprehensive_logging(
-            model, train_dataset, val_dataset, max_epochs=4000, time_limit=3600
+            model,
+            train_dataset,
+            val_dataset,
+            adamw_epochs=3000,
+            lbfgs_steps=100,
+            time_limit=3600,
         )
     )
 
