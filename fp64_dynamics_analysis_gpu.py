@@ -465,7 +465,7 @@ def create_training_dataset(recurrence_fn, num_samples=200):
 
 
 def train_with_comprehensive_logging(
-    model, train_dataset, val_dataset=None, max_epochs=10000, time_limit=3600
+    model, train_dataset, val_dataset=None, max_epochs=4000, time_limit=3600
 ):  # 1 hour limit
     """Train model with comprehensive per-layer logging"""
     if not train_dataset:
@@ -621,7 +621,7 @@ def main():
     # Train with comprehensive logging (1 hour limit, 10k max epochs)
     best_loss, epochs, logger, milestones, total_time = (
         train_with_comprehensive_logging(
-            model, train_dataset, val_dataset, max_epochs=10000, time_limit=3600
+            model, train_dataset, val_dataset, max_epochs=4000, time_limit=3600
         )
     )
 
