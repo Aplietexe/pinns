@@ -1,0 +1,42 @@
+{
+  "model_type": "ImprovedTransformerFP64",
+  "parameters": {
+    "d_model": 128,
+    "nhead": 8,
+    "num_layers": 2
+  },
+  "dtype": "float64",
+  "total_parameters": 271745,
+  "layer_names": [
+    "_orig_mod.pos_encoding",
+    "_orig_mod.input_proj.weight",
+    "_orig_mod.input_proj.bias",
+    "_orig_mod.transformer.layers.0.self_attn.in_proj_weight",
+    "_orig_mod.transformer.layers.0.self_attn.in_proj_bias",
+    "_orig_mod.transformer.layers.0.self_attn.out_proj.weight",
+    "_orig_mod.transformer.layers.0.self_attn.out_proj.bias",
+    "_orig_mod.transformer.layers.0.linear1.weight",
+    "_orig_mod.transformer.layers.0.linear1.bias",
+    "_orig_mod.transformer.layers.0.linear2.weight",
+    "_orig_mod.transformer.layers.0.linear2.bias",
+    "_orig_mod.transformer.layers.0.norm1.weight",
+    "_orig_mod.transformer.layers.0.norm1.bias",
+    "_orig_mod.transformer.layers.0.norm2.weight",
+    "_orig_mod.transformer.layers.0.norm2.bias",
+    "_orig_mod.transformer.layers.1.self_attn.in_proj_weight",
+    "_orig_mod.transformer.layers.1.self_attn.in_proj_bias",
+    "_orig_mod.transformer.layers.1.self_attn.out_proj.weight",
+    "_orig_mod.transformer.layers.1.self_attn.out_proj.bias",
+    "_orig_mod.transformer.layers.1.linear1.weight",
+    "_orig_mod.transformer.layers.1.linear1.bias",
+    "_orig_mod.transformer.layers.1.linear2.weight",
+    "_orig_mod.transformer.layers.1.linear2.bias",
+    "_orig_mod.transformer.layers.1.norm1.weight",
+    "_orig_mod.transformer.layers.1.norm1.bias",
+    "_orig_mod.transformer.layers.1.norm2.weight",
+    "_orig_mod.transformer.layers.1.norm2.bias",
+    "_orig_mod.output.weight",
+    "_orig_mod.output.bias",
+    "AGGREGATE"
+  ]
+}
